@@ -79,7 +79,7 @@ BANKS = [
     ("交通银行广州珠村支行", "EUR", "bocom"),
 ]
 NROW = 9            # A..I 共 9 列
-BLOCK_ROWS = 10     # 1 日期行 + 8 银行行 + 1 空行
+BLOCK_ROWS = 9      # 每块 8 行银行数据 + 1 空行（日期/时间写在每行 A/B 列）
 DATA_START = 1      # row 0 是表头，数据从 row 1 起
 READ_SPAN = 400     # 幂等判定只读表头下 400 行（倒序后足够覆盖今日+昨日）
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"}
@@ -324,13 +324,41 @@ def block_clean(blk):
     return len(blk) >= 8 and not any(r[5].strip() == "数据源异常" for r in blk)
 
 
-def insert_pos(new_key, ordered_blocks):
-    """倒序插入位置：返回第一个 key > new_key 的块的 start_row；若没有则返回 DATA_START。
-    这样无论补录还是正常抓，新块都落在时间序正确的位置。"""
+def insert_pos(new_key, ordered_blocks, tail_pos):
+    """倒序布局下的插入位置。
+
+    ordered_blocks 必须按表中顺序（= 行号升序 = 时间倒序）传入。
+    返回第一个【比 new_key 更旧】的块的 start_row —— 新块插到它上方，
+    即整个时间序仍保持倒序。若没有块比 new_key 更旧，说明 new_key 是全表
+    最旧，应追加到表尾（tail_pos）。
+    """
     for key, st, _ in ordered_blocks:
-        if key > new_key:
+        if key < new_key:
             return st
-    return DATA_START
+    return tail_pos
+
+
+def sheet_tail_pos(blocks, rows_read):
+    """估算表尾下一空行位置（0-based 行号，可直接 insert）。
+
+    倒序布局下新块通常插在顶部（DATA_START），只有补录"比全表都旧"的时点才会
+    走到表尾。若读取窗口已被占满（说明表比 READ_SPAN 还长），再单独定位一次真表尾。
+    """
+    tail = (blocks[-1][1] + BLOCK_ROWS) if blocks else DATA_START
+    if rows_read >= READ_SPAN and rows_read and any(c.strip() for c in rows_read[-1]):
+        r = mcp_call("get_sheet_info", {"file_id": FILE_ID})
+        txt = r.get("text") or r.get("raw") or ""
+        try:
+            info = json.loads(r["content"][0]["text"]) if "content" in r else json.loads(txt)
+        except Exception:  # noqa: BLE001
+            info = {}
+        for sh in (info.get("sheets") or info.get("sheet_list") or []):
+            if str(sh.get("sheet_id")) == SHEET_ID:
+                last = sh.get("row_count") or sh.get("used_range", {}).get("last_row")
+                if last is not None:
+                    tail = max(tail, int(last))
+                break
+    return tail
 
 
 def main():
@@ -479,7 +507,7 @@ def main():
             action = "刷新"
             retry(lambda st=start, tx=_csv(new_rows): sheet_write(st, 0, tx))
         else:
-            pos = insert_pos(new_key, blocks)
+            pos = insert_pos(new_key, blocks, sheet_tail_pos(blocks, len(rows)))
             retry(lambda p=pos: sheet_insert_rows(p, BLOCK_ROWS))
             start = pos
             action = "新写入(倒序插入)"
