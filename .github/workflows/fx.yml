@@ -27,7 +27,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Run fx inquiry
         env:
-          TDOC_TOKEN: \${{ secrets.TDOC_TOKEN }}
-          FX_SLOT: \${{ github.event.inputs.slot }}
-          GITHUB_TOKEN: \${{ github.token }}
+          TDOC_TOKEN: ${{ secrets.TDOC_TOKEN }}
+          FX_SLOT: ${{ github.event.inputs.slot }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: python3 forex/forex_cloud.py
