@@ -1,0 +1,33 @@
+name: fx-inquiry
+# 银行询价（public 仓库链条接力版 v5）：GitHub schedule 对新 workflow 注册失效，
+# 且私有仓库 Actions 分钟数有限（2000/月），故迁至 public 仓库（Actions 免费）：
+#   种子点火（每天1次）→ 每次运行结束 dispatch 下一棒 → 链条覆盖全天11个时点
+#   09:40/10:00/10:30/11:00/11:30/14:00/15:00/15:30/16:15/16:50/17:30
+#   → 北京 17:56 收工（脚本内终止）。
+# 幂等：块已存在且完整→跳过；窗口=[时点-10分,+25分]，过点不补（宁缺毋假）。
+on:
+  schedule:
+    - cron: "*/15 1-10 * * 1-5"   # 冗余保留（public 不计费，若注册恢复则幂等无害）
+  workflow_dispatch:
+    inputs:
+      slot:
+        description: "时点(0940/1000/1030/1100/1130/1400/1500/1530/1615/1650/1730)，留空自动判定"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  actions: write        # 接力 dispatch 下一棒
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run fx inquiry
+        env:
+          TDOC_TOKEN: \${{ secrets.TDOC_TOKEN }}
+          FX_SLOT: \${{ github.event.inputs.slot }}
+          GITHUB_TOKEN: \${{ github.token }}
+        run: python3 forex/forex_cloud.py
