@@ -1,18 +1,31 @@
 # -*- coding: utf-8 -*-
-"""银行询价云端抓取→腾讯文档直写（GitHub Actions 版 v2）
+"""银行询价云端抓取→腾讯文档直写（GitHub Actions 版 v3）
 
-v2 变更（修复 15:00 时点从未触发的问题）：
-  1. cron 改为工作日 UTC 1:00-8:50 每 10 分钟（北京 9:00-16:50），由脚本自行判定
-     应抓时点——GitHub 定时触发偶发延迟/丢失不再导致某个时点整天漏抓
-  2. 幂等：时点块已存在且数据完整（≥8行、无"数据源异常"）→ 跳过不重写
-  3. 补漏：当日已过时点若仍无数据或存在异常行 → 自动补写/就地重写
-  4. 修复 v1 刷新旧块时公司名称列被清空的 bug；读取范围 500→2000 行
-  5. 回读校验失败以非零退出码结束（Action 标红，GitHub 自动发邮件提醒）
+v3 变更（修复 10-12 下午全部时点漏写 + 表格改为倒序）：
+  【事故根因】v2 用"链条接力"（每棒结束 dispatch 下一棒）维持全天，
+    但 mcp_call 在配额报错(400007)时抛异常 → main 崩溃 → finally 里
+    chain_next() 仍无条件接力 → 每 15 秒刷一棒，每棒又重复 sheet_read
+    消耗配额 → 配额被打爆 → 下午 14:00/15:00/15:30/16:15/16:50/17:30
+    全部写入失败。
+  【v3 修复】
+  1. 彻底删除链条接力（chain_next 变空操作）。改由 GitHub Actions
+     schedule（每 15 分钟，北京 09:00-18:00）+ 本机每 30 分钟保活点火
+     驱动。全天约 40 棒，不再刷棒，配额消耗降至 1/60。
+  2. 配额错误(400007)不重试、不接力，直接退出，等下一棒自然恢复。
+  3. 表格改为【倒序】：最新时点永远在最上面（表头下第一行起）。
+     写入用 insert_dimension 在正确位置插入 10 行（1 日期 + 8 银行 + 1 空行）。
+  4. 幂等判定只需读表头前 400 行（倒序后今日/昨日数据都在顶部），
+     省掉 v2 的"读 20000 行定位表尾"，MCP 调用数从 2 次降到 1 次。
 
 功能：工作日 09:40/10:00/10:30/11:00/11:30/14:00/15:00/15:30/16:15/16:50/17:30
      （北京时间）共11个时点，抓取 8 家银行现汇买入价，
      按"牌价+优惠点=最终报价"计算后直写腾讯文档「银行询价」子表。
      节假日自动跳过；单家银行失败写"数据源异常"，绝不编造。
+
+表格布局（0-based 行号）：
+     row 0        表头
+     row 1 起     数据块，每块 10 行 = 1 日期行 + 8 银行行 + 1 空行
+     块按【时间倒序】排列，最新在最上面
 
 数据源（全部官方，中信为聚合站兜底并标注）：
   农业银行(美元)  https://ewealth.abchina.com/app/data/api/DataService/ExchangeRateV2  ÷100
@@ -27,7 +40,7 @@ v2 变更（修复 15:00 时点从未触发的问题）：
 
 环境变量：
   TDOC_TOKEN  腾讯文档 MCP Authorization Token（32位hex，与本地 ~/.mcporter/mcporter.json 一致）
-  FX_SLOT     可选，强制指定时点（1000/1100/1500/1615）；缺省自动判定+补漏
+  FX_SLOT     可选，强制指定时点（0940/1000/.../1730），用于人工补录
   FX_DRYRUN   设为 1 则只抓取计算不写表
 """
 import csv
@@ -65,17 +78,22 @@ BANKS = [
     ("兴业银行赣州分行营业部", "EUR", "cib"),
     ("交通银行广州珠村支行", "EUR", "bocom"),
 ]
+NROW = 9            # A..I 共 9 列
+BLOCK_ROWS = 10     # 1 日期行 + 8 银行行 + 1 空行
+DATA_START = 1      # row 0 是表头，数据从 row 1 起
+READ_SPAN = 400     # 幂等判定只读表头下 400 行（倒序后足够覆盖今日+昨日）
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"}
 SSL_CTX = ssl.create_default_context()
 SSL_CTX.options |= 0x4  # 允许旧式 TLS 重协商（农行/交行需要）
 OPENER = urllib.request.build_opener(urllib.request.HTTPSHandler(context=SSL_CTX))
 
-_log = []
+
+class QuotaExceeded(RuntimeError):
+    """腾讯文档 MCP 配额打爆（400007）。不可重试，必须立即退出等下一棒。"""
 
 
 def log(msg):
     print(msg, flush=True)
-    _log.append(str(msg))
 
 
 def http_get(url, headers=None, timeout=25):
@@ -110,6 +128,8 @@ def retry(fn, times=2):
     for _ in range(times + 1):
         try:
             return fn()
+        except QuotaExceeded:
+            raise                      # 配额错误不重试
         except Exception as e:  # noqa: BLE001
             last = e
             time.sleep(2)
@@ -213,76 +233,68 @@ FETCHERS = {"abc": fetch_abc, "citic": fetch_citic, "ccb": fetch_ccb,
 # ──────────────────────── 腾讯文档 MCP HTTP 客户端 ────────────────────────
 
 def mcp_call(tool, arguments):
+    """单次调用，不做内部重试（重试由外层 retry 控制）。
+    配额错误 400007 立即抛 QuotaExceeded，不重试。"""
     token = os.environ["TDOC_TOKEN"]
     body = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
             "params": {"name": tool, "arguments": arguments}}
-    last = None
-    for _ in range(3):
-        try:
-            req = urllib.request.Request(
-                SHEET_MCP, data=json.dumps(body).encode(),
-                headers={"Content-Type": "application/json", "Accept": "application/json, text/event-stream",
-                         "Authorization": token})
-            resp = urllib.request.urlopen(req, timeout=60)
-            j = json.loads(resp.read())
-            if "error" in j:
-                raise RuntimeError(f"MCP error: {j['error']}")
-            res = j["result"]
-            text = res["content"][0]["text"] if res.get("content") else ""
-            if res.get("isError"):
-                raise RuntimeError(f"MCP tool error: {str(text)[:200]}")
-            try:
-                return json.loads(text)
-            except (json.JSONDecodeError, TypeError):
-                return {"raw": text}
-        except Exception as e:  # noqa: BLE001
-            last = e
-            time.sleep(3)
-    raise last
+    req = urllib.request.Request(
+        SHEET_MCP, data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json", "Accept": "application/json, text/event-stream",
+                 "Authorization": token})
+    resp = urllib.request.urlopen(req, timeout=60)
+    j = json.loads(resp.read())
+    if "error" in j:
+        if j["error"].get("code") == 400007:
+            raise QuotaExceeded("腾讯文档配额打爆(400007)，本棒放弃，等下一棒")
+        raise RuntimeError(f"MCP error: {j['error']}")
+    res = j["result"]
+    text = res["content"][0]["text"] if res.get("content") else ""
+    if res.get("isError"):
+        if "400007" in str(text):
+            raise QuotaExceeded("腾讯文档配额打爆(400007)，本棒放弃，等下一棒")
+        raise RuntimeError(f"MCP tool error: {str(text)[:200]}")
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return {"raw": text}
 
 
-def sheet_find_tail():
-    """只读 A:B 两列定位表最后一行有数据的位置（轻量）。固定 2000 行上限在
-    表格每天增长约110行、约18天后会造成新块写错位置并覆盖已有数据。"""
+def sheet_read():
+    """只读表头下 READ_SPAN 行（倒序布局：今日/昨日块都在顶部）。"""
     r = mcp_call("get_cell_data", {"file_id": FILE_ID, "sheet_id": SHEET_ID,
-                                   "start_row": 0, "start_col": 0, "end_row": 20000, "end_col": 1,
+                                   "start_row": 0, "start_col": 0,
+                                   "end_row": READ_SPAN - 1, "end_col": NROW - 1,
                                    "return_csv": True})
     rows = list(csv.reader(io.StringIO(r.get("csv_data", ""))))
-    last = 0
-    for i, rr in enumerate(rows):
-        a = (list(rr) + ["", ""])[0].strip()
-        b = (list(rr) + ["", ""])[1].strip()
-        if a or b:
-            last = i
-    return last
+    return [list(x)[:NROW] + [""] * max(0, NROW - len(x)) for x in rows]
 
 
-def sheet_read(span=600):
-    """返回 (rows, base)：只读表尾 span 行（覆盖约45天，足够算变动基准），
-    base 为 rows[0] 对应的绝对行号。"""
-    last = sheet_find_tail()
-    base = max(0, last - span)
-    r = mcp_call("get_cell_data", {"file_id": FILE_ID, "sheet_id": SHEET_ID,
-                                   "start_row": base, "start_col": 0, "end_row": last + 1, "end_col": 9,
-                                   "return_csv": True})
-    rows = list(csv.reader(io.StringIO(r.get("csv_data", ""))))
-    return [list(r[:9]) + [""] * max(0, 9 - len(r)) for r in rows], base
+def sheet_insert_rows(index, count):
+    return mcp_call("insert_dimension", {"file_id": FILE_ID, "sheet_id": SHEET_ID,
+                                        "dimension_type": "row", "direction": "before",
+                                        "index": index, "count": count})
 
 
 def sheet_write(start_row, start_col, rows_csv_text):
     return mcp_call("set_range_value_by_csv", {"file_id": FILE_ID, "sheet_id": SHEET_ID,
-                                               "start_row": start_row, "start_col": start_col,
-                                               "csv_data": rows_csv_text})
+                                              "start_row": start_row, "start_col": start_col,
+                                              "csv_data": rows_csv_text})
 
 
 def fmt(x):
     return f"{x:.4f}" if isinstance(x, float) else str(x)
 
 
-def parse_blocks(rows, base=0):
-    """按「日期+时间」组合键分块（每行A列都有日期，不能按行分块）。
-    base 为 rows[0] 的绝对行号，块起始行号按绝对行记录。"""
-    blocks = {}
+def to_min(hhmm):
+    h, m = hhmm.split(":")
+    return int(h) * 60 + int(m)
+
+
+def parse_blocks(rows):
+    """按「日期+时间」组合键分块，返回按表中顺序（时间倒序）的块列表。
+    每项 = (key, start_row, rows)，key=(日期, 时点分钟) 用于排序定位。"""
+    out = []
     cur_key, cur_start, cur_rows = None, None, []
     for i, r in enumerate(rows):
         a, b = r[0].strip(), r[1].strip()
@@ -290,21 +302,21 @@ def parse_blocks(rows, base=0):
         all_empty = not any(c.strip() for c in r)
         if all_empty:
             if cur_key and cur_rows:
-                blocks.setdefault(cur_key[0], {})[cur_key[1]] = (cur_start, cur_rows)
+                out.append((cur_key, cur_start, cur_rows))
             cur_key, cur_rows = None, []
         elif is_date_row:
-            if cur_key and cur_rows and cur_key != (a, b):
-                blocks.setdefault(cur_key[0], {})[cur_key[1]] = (cur_start, cur_rows)
+            if cur_key and cur_rows and cur_key != (a, to_min(b)):
+                out.append((cur_key, cur_start, cur_rows))
                 cur_key, cur_rows = None, []
-            if cur_key != (a, b):
-                cur_key, cur_start, cur_rows = (a, b), base + i, [r]
+            if cur_key != (a, to_min(b)):
+                cur_key, cur_start, cur_rows = (a, to_min(b)), i, [r]
             else:
                 cur_rows.append(r)
         elif cur_key:
             cur_rows.append(r)
     if cur_key and cur_rows:
-        blocks.setdefault(cur_key[0], {})[cur_key[1]] = (cur_start, cur_rows)
-    return blocks
+        out.append((cur_key, cur_start, cur_rows))
+    return out
 
 
 def block_clean(blk):
@@ -312,64 +324,56 @@ def block_clean(blk):
     return len(blk) >= 8 and not any(r[5].strip() == "数据源异常" for r in blk)
 
 
+def insert_pos(new_key, ordered_blocks):
+    """倒序插入位置：返回第一个 key > new_key 的块的 start_row；若没有则返回 DATA_START。
+    这样无论补录还是正常抓，新块都落在时间序正确的位置。"""
+    for key, st, _ in ordered_blocks:
+        if key > new_key:
+            return st
+    return DATA_START
+
+
 def main():
     now = datetime.now(BJ)
     today = now.strftime("%Y-%m-%d")
     now_min = now.hour * 60 + now.minute
-    log(f"=== 银行询价 v2 云端运行 北京时间 {now:%Y-%m-%d %H:%M} ===")
+    log(f"=== 银行询价 v3 云端运行 北京时间 {now:%Y-%m-%d %H:%M} ===")
 
     # 0. 确定本次应处理的时点
-    slot_env = os.environ.get("FX_SLOT")
+    slot_env = (os.environ.get("FX_SLOT") or "").strip()
     if slot_env:
-        due_slots = [(int(slot_env[:2]), int(slot_env[2:]))]
-        log(f"FX_SLOT={slot_env}，强制处理该时点。")
+        hh, mm = slot_env[:2], slot_env[2:]
+        due_slots = [(int(hh), int(mm))]
+        log(f"FX_SLOT={slot_env}，强制处理该时点（人工补录）。")
     else:
         if now.weekday() >= 5:
-            log("周末休市，快速退出。")
+            log("周末休市，退出。")
             return 0
         due_slots = [s for s in SLOTS
                      if -WINDOW_EARLY <= now_min - (s[0] * 60 + s[1]) <= WINDOW_LATE]
         if not due_slots:
-            nxt = next((s for s in SLOTS if s[0] * 60 + s[1] - WINDOW_EARLY > now_min), None)
-            if nxt is None:
-                # 已过全部时点窗口：睡到收工点再退出（chain_next 到点自然停止），防秒级空转刷棒
-                log(f"北京 {now:%H:%M} 已过全部时点窗口，睡到 17:57 收工。")
-                time.sleep(max(0, 17 * 60 + 57 - now_min) * 60)
-                return 0
-            wait_min = nxt[0] * 60 + nxt[1] - WINDOW_EARLY - now_min + 1
-            log(f"北京 {now:%H:%M} 不在任何时点窗口内，等待 {wait_min} 分钟至 "
-                f"{nxt[0]:02d}:{nxt[1]:02d} 窗口（防秒级空转刷棒）。")
-            time.sleep(wait_min * 60)
-            now = datetime.now(BJ)
-            today = now.strftime("%Y-%m-%d")
-            now_min = now.hour * 60 + now.minute
-            due_slots = [s for s in SLOTS
-                         if -WINDOW_EARLY <= now_min - (s[0] * 60 + s[1]) <= WINDOW_LATE] or [nxt]
+            log(f"北京 {now:%H:%M} 不在任何时点窗口内，正常退出（等待下一次 schedule 触发）。")
+            return 0
 
-    # 1. 读表（先做幂等判定，全部跳过时无需抓数，节省运行时长）
-    rows, base = retry(sheet_read)
-    blocks = parse_blocks(rows, base)
-    today_blocks = dict(blocks.get(today, {}))
-    dates = sorted(d for d in blocks if d <= today)
+    # 1. 读表（幂等判定）
+    rows = retry(sheet_read)
+    blocks = parse_blocks(rows)
+    idx = {k: (st, rs) for k, st, rs in blocks}
+    today_blocks = {k: v for k, v in idx.items() if k[0] == today}
+    dates = sorted(d for d, _ in idx if d <= today)
     prev_day = next((d for d in reversed(dates) if d < today), None)
-    log(f"表内已有: 今日{list(today_blocks.keys()) or '无'} "
-        f"上日({prev_day}){list(blocks.get(prev_day, {}).keys()) if prev_day else '无'}")
+    log(f"表内已有 {len(blocks)} 块；今日 {sorted(t[1] for t in today_blocks) or '无'}；"
+        f"上日({prev_day}) {sorted(t[1] for t in idx if t[0] == prev_day) if prev_day else '无'}")
 
     todo = []
     for s in due_slots:
-        k = SLOT_NAMES[s]
-        if k in today_blocks and block_clean(today_blocks[k][1]):
-            log(f"{k} 块已存在且数据完整，跳过。")
+        k = (today, s[0] * 60 + s[1])
+        if k in idx and block_clean(idx[k][1]):
+            log(f"{SLOT_NAMES[s]} 块已存在且数据完整，跳过。")
         else:
             todo.append(s)
     if not todo:
-        end_min = max(s[0] * 60 + s[1] for s in due_slots) + WINDOW_LATE
-        if end_min > now_min:
-            log(f"本次应处理时点均已完整，等待窗口结束 {end_min // 60:02d}:{end_min % 60:02d} "
-                f"后退出（防秒级接力刷棒）。")
-            time.sleep((end_min + 1 - now_min) * 60)
-        else:
-            log("本次应处理时点均已完整，无需写入，退出。")
+        log("本次应处理时点均已完整，无需写入，退出。")
         return 0
 
     # 2. 抓数（含节假日判定）
@@ -379,10 +383,7 @@ def main():
         log(f"[异常] 中行抓取失败: {e!r}")
         pub_date, boc_usd, boc_eur = None, None, None
     if pub_date and pub_date != today:
-        end_min = max(s[0] * 60 + s[1] for s in due_slots) + WINDOW_LATE
-        log(f"中行牌价发布日期为 {pub_date}（非今日），判定休市，"
-            f"睡到窗口结束 {end_min // 60:02d}:{end_min % 60:02d} 后退出（防秒级接力刷棒）。")
-        time.sleep(max(0, end_min + 1 - now_min) * 60)
+        log(f"中行牌价发布日期为 {pub_date}（非今日），判定休市，退出。")
         return 0
 
     prices = {"boc": {"USD": boc_usd, "EUR": boc_eur}, "note": {}}
@@ -396,35 +397,44 @@ def main():
     log("抓取结果: " + json.dumps({k: v for k, v in prices.items() if k != "note"},
                                   ensure_ascii=False))
 
-    bank_row = lambda blk: {r[3].strip(): r for r in blk}  # noqa: E731
+    def bank_rows_of(blk):
+        return {r[3].strip(): r for r in blk}
 
-    def prev_block_rows(slot_idx):
+    def block_by_time(target_day, target_min):
+        v = idx.get((target_day, target_min))
+        return bank_rows_of(v[1]) if v else None
+
+    def prev_block_rows(slot_name):
         """变动列基准：今日更早时点块 > 上一日最后一块。"""
-        for k in reversed(SLOT_ORDER[:slot_idx]):
-            if k in today_blocks:
-                return bank_row(today_blocks[k][1])
-        if prev_day and blocks.get(prev_day):
-            lk = list(blocks[prev_day].keys())[-1]
-            return bank_row(blocks[prev_day][lk][1])
+        si = SLOT_INDEX[slot_name]
+        for j in range(si - 1, -1, -1):
+            r_ = block_by_time(today, to_min(SLOT_ORDER[j]))
+            if r_:
+                return r_
+        if prev_day:
+            cand = sorted(t[1] for t in idx if t[0] == prev_day)
+            if cand:
+                return block_by_time(prev_day, cand[-1])
         return None
 
     def disc_source():
         """优惠点来源：今日最新一块 > 上一日最后一块。"""
-        for k in reversed(SLOT_ORDER):
-            if k in today_blocks:
-                return bank_row(today_blocks[k][1])
-        if prev_day and blocks.get(prev_day):
-            lk = list(blocks[prev_day].keys())[-1]
-            return bank_row(blocks[prev_day][lk][1])
+        if today_blocks:
+            return bank_rows_of(today_blocks[max(today_blocks, key=lambda t: t[1])][1])
+        if prev_day:
+            cand = sorted(t[1] for t in idx if t[0] == prev_day)
+            if cand:
+                return block_by_time(prev_day, cand[-1])
         return None
 
     written = []
-    for slot in todo:  # SLOTS 顺序即时间顺序
+    for slot in todo:
         slot_name = SLOT_NAMES[slot]
-        slot_idx = SLOT_INDEX[slot_name]
-        delta = now_min - (slot[0] * 60 + slot[1])
+        slot_min = slot[0] * 60 + slot[1]
+        new_key = (today, slot_min)
+        delta = now_min - slot_min
         tag = "窗口" if delta <= 20 else "补漏"
-        prev_slot_rows = prev_block_rows(slot_idx)
+        prev_slot_rows = prev_block_rows(slot_name)
         disc_src = disc_source()
 
         # 3. 组装 8 行
@@ -452,7 +462,7 @@ def main():
             new_rows.append([today, slot_name, "", name, ccy, f_txt, disc, final, change or "-"])
             summary.append(f"{name}({ccy}): 牌价{f_txt} 优惠{disc or '?'} 最终{final or '?'} 变动{change or '-'}")
 
-        # 公司名称列从来源块复制（append/refresh 统一处理，修复 v1 refresh 清空C列的bug）
+        # 公司名称列从来源块复制
         for r in new_rows:
             if r[3] in (disc_src or {}):
                 r[2] = disc_src[r[3]][2]
@@ -463,40 +473,52 @@ def main():
                 log(f"  {s_}  | {'|'.join(r_)}")
             continue
 
-        # 4. 写入（已有块就地刷新；无块追加到表尾，块间空一行）
-        if slot_name in today_blocks:
-            start = today_blocks[slot_name][0]
+        # 4. 写入：已有块→ 就地刷新；新块 → 倒序位置插入 BLOCK_ROWS 行后写入
+        if new_key in idx:
+            start = idx[new_key][0]
             action = "刷新"
+            retry(lambda st=start, tx=_csv(new_rows): sheet_write(st, 0, tx))
         else:
-            pos = [(st + len(rs)) for d_ in blocks for st, rs in blocks[d_].values()]
-            start = (max(pos) + 2) if pos else 1
-            action = "新写入"
-        csv_text = "\n".join(",".join("" if x in ("", None) else str(x) for x in r) for r in new_rows)
-        retry(lambda st=start, tx=csv_text: sheet_write(st, 0, tx))
+            pos = insert_pos(new_key, blocks)
+            retry(lambda p=pos: sheet_insert_rows(p, BLOCK_ROWS))
+            start = pos
+            action = "新写入(倒序插入)"
+            retry(lambda st=start, tx=_csv(new_rows): sheet_write(st, 0, tx))
         log(f"{slot_name}（{tag}）{action}完成：第 {start + 1} 行起 8 行")
         for s_ in summary:
             log("  " + s_)
-        today_blocks[slot_name] = (start, new_rows)
-        blocks[today] = today_blocks
-        written.append(slot_name)
+        written.append((slot_name, start))
+        # 同步内存态：插入后其下方所有块行号下移 BLOCK_ROWS，再加入新块并按行号排序
+        # （表中块顺序 == 时间倒序 == 行号升序）
+        blocks = [(k, st + (BLOCK_ROWS if st >= start else 0), rs) for k, st, rs in blocks]
+        blocks.append((new_key, start, new_rows))
+        blocks.sort(key=lambda x: x[1])
+        idx = {k: (st, rs) for k, st, rs in blocks}
+        today_blocks = {k: v for k, v in idx.items() if k[0] == today}
 
     if os.environ.get("FX_DRYRUN") == "1" or not written:
         return 0
 
     # 5. 回读校验（失败→非零退出码，GitHub 会邮件提醒）
-    rows2, base2 = retry(sheet_read)
-    blocks2 = parse_blocks(rows2, base2)
+    try:
+        rows2 = retry(sheet_read)
+    except QuotaExceeded as e:
+        log(f"[校验跳过] {e}")
+        return 0
+    blocks2 = parse_blocks(rows2)
+    idx2 = {k: rs for k, _, rs in blocks2}
     fails = []
-    for k in written:
-        blk = blocks2.get(today, {}).get(k)
+    for name, _start in written:
+        k = (today, to_min(name))
+        blk = idx2.get(k)
         if not blk:
-            fails.append(k)
-            log(f"[校验失败] {k} 未回读到块")
+            fails.append(name)
+            log(f"[校验失败] {name} 未回读到块")
             continue
-        ok = sum(1 for r in blk[1] if r[0] == today and r[1] == k)
-        log(f"回读校验 {k}: {ok}/8 行匹配（第 {blk[0] + 1} 行起）")
+        ok = sum(1 for r in blk if r[0] == today and r[1] == name)
+        log(f"回读校验 {name}: {ok}/8 行匹配")
         if ok < 8:
-            fails.append(k)
+            fails.append(name)
     if prices["note"]:
         log("异常源: " + json.dumps(prices["note"], ensure_ascii=False))
     log(f"文档: https://docs.qq.com/sheet/{FILE_ID}")
@@ -506,45 +528,17 @@ def main():
     return 0
 
 
-REPO_API = "https://api.github.com/repos/Randy985211/wb-fx-inquiry"
-
-
-def chain_next():
-    """链条接力：每次运行结束触发下一棒（public 仓库 Actions 免费不限时）。
-    GitHub schedule 对新 workflow 注册失效，链条模式彻底绕开 schedule：
-    每天一次种子点火 → 自续到北京 17:56 收工；08:00 前的空转不接力。"""
-    now = datetime.now(BJ)
-    now_min = now.hour * 60 + now.minute
-    if now_min >= 17 * 60 + 56 or now_min < 8 * 60:
-        return
-    if now.weekday() >= 5:
-        return  # 周末休市，不空转
-    tok = os.environ.get("GITHUB_TOKEN")
-    if not tok:
-        return  # 本地手动运行无 GITHUB_TOKEN，不接力
-    last = None
-    for _ in range(3):
-        try:
-            req = urllib.request.Request(
-                f"{REPO_API}/actions/workflows/fx.yml/dispatches",
-                data=json.dumps({"ref": "main"}).encode(),
-                headers={"Authorization": f"Bearer {tok}", "Accept": "application/vnd.github+json",
-                         "User-Agent": "fx-chain"})
-            urllib.request.urlopen(req, timeout=30).read()
-            log(f"[接力] 已触发下一棒（{now:%H:%M}）")
-            return
-        except Exception as e:  # noqa: BLE001
-            last = e
-            time.sleep(3)
-    log(f"[接力失败] {last!r}")
+def _csv(rows):
+    return "\n".join(",".join("" if x in ("", None) else str(x) for x in r) for r in rows)
 
 
 if __name__ == "__main__":
     try:
-        _code = main()
-    finally:
-        try:
-            chain_next()
-        except Exception:  # noqa: BLE001
-            pass
-    sys.exit(_code)
+        sys.exit(main())
+    except QuotaExceeded as e:
+        # 配额打爆：安静退出，等下一棒（schedule 每15分钟/保活每30分钟）自然恢复
+        log(f"[配额受限] {e}")
+        sys.exit(0)
+    except Exception as e:  # noqa: BLE001
+        log(f"[异常] {e!r}")
+        sys.exit(1)
