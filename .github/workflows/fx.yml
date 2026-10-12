@@ -1,13 +1,14 @@
 name: fx-inquiry
-# 银行询价（public 仓库链条接力版 v5）：GitHub schedule 对新 workflow 注册失效，
-# 且私有仓库 Actions 分钟数有限（2000/月），故迁至 public 仓库（Actions 免费）：
-#   种子点火（每天1次）→ 每次运行结束 dispatch 下一棒 → 链条覆盖全天11个时点
-#   09:40/10:00/10:30/11:00/11:30/14:00/15:00/15:30/16:15/16:50/17:30
-#   → 北京 17:56 收工（脚本内终止）。
+# 银行询价（public 仓库 · schedule 驱动版 v6）
+# v5 的"链条接力"已废除：配额报错时 main 崩溃仍无条件接力，导致每15秒刷一棒、
+# 每棒重复 sheet_read，把腾讯文档 MCP 配额打爆(400007)，10-12 下午全部时点漏写。
+# v6：纯 schedule（每15分钟，北京 09:00-18:00）+ 本机每30分钟保活点火。
+#     全天约 40 棒，脚本内无窗口即退出，无 sleep，无接力 → 配额消耗降至 1/60。
 # 幂等：块已存在且完整→跳过；窗口=[时点-10分,+25分]，过点不补（宁缺毋假）。
+# 表格倒序：最新时点永远在最上面。
 on:
   schedule:
-    - cron: "*/15 1-10 * * 1-5"   # 冗余保留（public 不计费，若注册恢复则幂等无害）
+    - cron: "*/15 1-10 * * 1-5"   # UTC 01:00-10:45 = 北京 09:00-18:45，覆盖全部11个时点
   workflow_dispatch:
     inputs:
       slot:
@@ -17,17 +18,19 @@ on:
 
 permissions:
   contents: read
-  actions: write        # 接力 dispatch 下一棒
+
+concurrency:
+  group: fx-inquiry
+  cancel-in-progress: false   # 同一时刻只跑一棒，避免并发写表
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 9
     steps:
       - uses: actions/checkout@v4
       - name: Run fx inquiry
         env:
           TDOC_TOKEN: ${{ secrets.TDOC_TOKEN }}
           FX_SLOT: ${{ github.event.inputs.slot }}
-          GITHUB_TOKEN: ${{ github.token }}
         run: python3 forex/forex_cloud.py
