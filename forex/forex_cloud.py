@@ -241,12 +241,32 @@ def mcp_call(tool, arguments):
     raise last
 
 
-def sheet_read():
+def sheet_find_tail():
+    """只读 A:B 两列定位表最后一行有数据的位置（轻量）。固定 2000 行上限在
+    表格每天增长约110行、约18天后会造成新块写错位置并覆盖已有数据。"""
     r = mcp_call("get_cell_data", {"file_id": FILE_ID, "sheet_id": SHEET_ID,
-                                   "start_row": 0, "start_col": 0, "end_row": 2000, "end_col": 9,
+                                   "start_row": 0, "start_col": 0, "end_row": 20000, "end_col": 1,
                                    "return_csv": True})
     rows = list(csv.reader(io.StringIO(r.get("csv_data", ""))))
-    return [list(r[:9]) + [""] * max(0, 9 - len(r)) for r in rows]
+    last = 0
+    for i, rr in enumerate(rows):
+        a = (list(rr) + ["", ""])[0].strip()
+        b = (list(rr) + ["", ""])[1].strip()
+        if a or b:
+            last = i
+    return last
+
+
+def sheet_read(span=600):
+    """返回 (rows, base)：只读表尾 span 行（覆盖约45天，足够算变动基准），
+    base 为 rows[0] 对应的绝对行号。"""
+    last = sheet_find_tail()
+    base = max(0, last - span)
+    r = mcp_call("get_cell_data", {"file_id": FILE_ID, "sheet_id": SHEET_ID,
+                                   "start_row": base, "start_col": 0, "end_row": last + 1, "end_col": 9,
+                                   "return_csv": True})
+    rows = list(csv.reader(io.StringIO(r.get("csv_data", ""))))
+    return [list(r[:9]) + [""] * max(0, 9 - len(r)) for r in rows], base
 
 
 def sheet_write(start_row, start_col, rows_csv_text):
@@ -259,8 +279,9 @@ def fmt(x):
     return f"{x:.4f}" if isinstance(x, float) else str(x)
 
 
-def parse_blocks(rows):
-    """按「日期+时间」组合键分块（每行A列都有日期，不能按行分块）。"""
+def parse_blocks(rows, base=0):
+    """按「日期+时间」组合键分块（每行A列都有日期，不能按行分块）。
+    base 为 rows[0] 的绝对行号，块起始行号按绝对行记录。"""
     blocks = {}
     cur_key, cur_start, cur_rows = None, None, []
     for i, r in enumerate(rows):
@@ -276,7 +297,7 @@ def parse_blocks(rows):
                 blocks.setdefault(cur_key[0], {})[cur_key[1]] = (cur_start, cur_rows)
                 cur_key, cur_rows = None, []
             if cur_key != (a, b):
-                cur_key, cur_start, cur_rows = (a, b), i, [r]
+                cur_key, cur_start, cur_rows = (a, b), base + i, [r]
             else:
                 cur_rows.append(r)
         elif cur_key:
@@ -310,8 +331,8 @@ def main():
             return 0
 
     # 1. 读表（先做幂等判定，全部跳过时无需抓数，节省运行时长）
-    rows = retry(sheet_read)
-    blocks = parse_blocks(rows)
+    rows, base = retry(sheet_read)
+    blocks = parse_blocks(rows, base)
     today_blocks = dict(blocks.get(today, {}))
     dates = sorted(d for d in blocks if d <= today)
     prev_day = next((d for d in reversed(dates) if d < today), None)
@@ -438,7 +459,8 @@ def main():
         return 0
 
     # 5. 回读校验（失败→非零退出码，GitHub 会邮件提醒）
-    blocks2 = parse_blocks(retry(sheet_read))
+    rows2, base2 = retry(sheet_read)
+    blocks2 = parse_blocks(rows2, base2)
     fails = []
     for k in written:
         blk = blocks2.get(today, {}).get(k)
@@ -470,6 +492,8 @@ def chain_next():
     now_min = now.hour * 60 + now.minute
     if now_min >= 17 * 60 + 56 or now_min < 8 * 60:
         return
+    if now.weekday() >= 5:
+        return  # 周末休市，不空转
     tok = os.environ.get("GITHUB_TOKEN")
     if not tok:
         return  # 本地手动运行无 GITHUB_TOKEN，不接力
