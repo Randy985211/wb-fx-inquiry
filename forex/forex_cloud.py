@@ -324,11 +324,27 @@ def main():
         due_slots = [(int(slot_env[:2]), int(slot_env[2:]))]
         log(f"FX_SLOT={slot_env}，强制处理该时点。")
     else:
+        if now.weekday() >= 5:
+            log("周末休市，快速退出。")
+            return 0
         due_slots = [s for s in SLOTS
                      if -WINDOW_EARLY <= now_min - (s[0] * 60 + s[1]) <= WINDOW_LATE]
         if not due_slots:
-            log(f"北京 {now:%H:%M} 不在任何时点窗口内（时点前{WINDOW_EARLY}分~后{WINDOW_LATE}分），快速退出。")
-            return 0
+            nxt = next((s for s in SLOTS if s[0] * 60 + s[1] - WINDOW_EARLY > now_min), None)
+            if nxt is None:
+                # 已过全部时点窗口：睡到收工点再退出（chain_next 到点自然停止），防秒级空转刷棒
+                log(f"北京 {now:%H:%M} 已过全部时点窗口，睡到 17:57 收工。")
+                time.sleep(max(0, 17 * 60 + 57 - now_min) * 60)
+                return 0
+            wait_min = nxt[0] * 60 + nxt[1] - WINDOW_EARLY - now_min + 1
+            log(f"北京 {now:%H:%M} 不在任何时点窗口内，等待 {wait_min} 分钟至 "
+                f"{nxt[0]:02d}:{nxt[1]:02d} 窗口（防秒级空转刷棒）。")
+            time.sleep(wait_min * 60)
+            now = datetime.now(BJ)
+            today = now.strftime("%Y-%m-%d")
+            now_min = now.hour * 60 + now.minute
+            due_slots = [s for s in SLOTS
+                         if -WINDOW_EARLY <= now_min - (s[0] * 60 + s[1]) <= WINDOW_LATE] or [nxt]
 
     # 1. 读表（先做幂等判定，全部跳过时无需抓数，节省运行时长）
     rows, base = retry(sheet_read)
@@ -347,7 +363,13 @@ def main():
         else:
             todo.append(s)
     if not todo:
-        log("本次应处理时点均已完整，无需写入，退出。")
+        end_min = max(s[0] * 60 + s[1] for s in due_slots) + WINDOW_LATE
+        if end_min > now_min:
+            log(f"本次应处理时点均已完整，等待窗口结束 {end_min // 60:02d}:{end_min % 60:02d} "
+                f"后退出（防秒级接力刷棒）。")
+            time.sleep((end_min + 1 - now_min) * 60)
+        else:
+            log("本次应处理时点均已完整，无需写入，退出。")
         return 0
 
     # 2. 抓数（含节假日判定）
@@ -357,7 +379,10 @@ def main():
         log(f"[异常] 中行抓取失败: {e!r}")
         pub_date, boc_usd, boc_eur = None, None, None
     if pub_date and pub_date != today:
-        log(f"中行牌价发布日期为 {pub_date}（非今日），判定休市，跳过写入。")
+        end_min = max(s[0] * 60 + s[1] for s in due_slots) + WINDOW_LATE
+        log(f"中行牌价发布日期为 {pub_date}（非今日），判定休市，"
+            f"睡到窗口结束 {end_min // 60:02d}:{end_min % 60:02d} 后退出（防秒级接力刷棒）。")
+        time.sleep(max(0, end_min + 1 - now_min) * 60)
         return 0
 
     prices = {"boc": {"USD": boc_usd, "EUR": boc_eur}, "note": {}}
